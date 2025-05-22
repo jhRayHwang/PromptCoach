@@ -1,90 +1,75 @@
 import os
+import glob
+import re
+
 import pandas as pd
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import textstat
 import nltk
-nltk.download('punkt', quiet=True)
-# sometimes word_tokenize also needs the 'punkt_tab' variant:
-nltk.download('punkt_tab', quiet=True)
-from nltk.tokenize import word_tokenize
-import matplotlib.pyplot as plt
+from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 
-# Ensure NLTK data is available
+# Ensure the punkt tokenizer is available for BLEU
 nltk.download('punkt', quiet=True)
 
-# 1) Perplexity Calculator using GPT-2
-class PerplexityCalculator:
-    def __init__(self, model_name='gpt2'):
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = AutoModelForCausalLM.from_pretrained(model_name).to(
-            torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        )
-    def perplexity(self, text):
-        enc = self.tokenizer(text, return_tensors='pt', truncation=True, max_length=1024).to(self.model.device)
-        with torch.no_grad():
-            loss = self.model(**enc, labels=enc['input_ids']).loss
-        return torch.exp(loss).item()
+# 1) Setup device & BLEU smoothing
+device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+smooth_fn = SmoothingFunction().method1
 
-# 2) Lexical diversity
-def lexical_diversity(text):
-    tokens = word_tokenize(text.lower())
+# 2) Initialize GPT-2 for perplexity
+MODEL_NAME = "gpt2"
+tokenizer  = AutoTokenizer.from_pretrained(MODEL_NAME)
+model      = AutoModelForCausalLM.from_pretrained(MODEL_NAME).to(device)
+
+def compute_perplexity(text: str) -> float:
+    enc = tokenizer(text, return_tensors="pt", truncation=True, max_length=1024).to(device)
+    with torch.no_grad():
+        loss = model(**enc, labels=enc["input_ids"]).loss
+    return torch.exp(loss).item()
+
+def lexical_diversity(text: str) -> float:
+    tokens = re.findall(r"\w+", text.lower())
     return len(set(tokens)) / len(tokens) if tokens else 0.0
 
-# 3) Evaluate a single file
-def evaluate_file(path, pp_calc):
-    df = pd.read_csv(path)
-    records = []
-    for _, row in df.iterrows():
-        resp = row['response']
-        records.append({
-            'intensity': row.get('intensity', None),
-            'readability': textstat.flesch_reading_ease(resp),
-            'perplexity': pp_calc.perplexity(resp),
-            'lex_diversity': lexical_diversity(resp)
-        })
-    return pd.DataFrame(records)
-
-# 4) Main routine
+# 3) Main processing loop
 def main():
-    # List your three files here
-    files = {
-        'anger':   'anger_responses.csv',
-        'anxious': 'anxious_responses.csv',
-        'sad':     'sad_responses.csv'
-    }
-    
-    # Initialize perplexity calculator
-    pp_calc = PerplexityCalculator('gpt2')
-    
-    # Dictionary to hold metrics per emotion
-    metrics = {}
-    
-    # Evaluate each
-    for emo, filepath in files.items():
-        if not os.path.exists(filepath):
-            print(f"❌ File not found: {filepath}")
-            continue
+    input_dir  = "convos"
+    output_dir = "results"
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Process all CSVs in convos/ ending with _convos.csv
+    for filepath in glob.glob(os.path.join(input_dir, "*_convos.csv")):
         print(f"▶ Evaluating {filepath}...")
-        mdf = evaluate_file(filepath, pp_calc)
-        metrics[emo] = mdf
-        out_csv = f"{emo}_metrics.csv"
-        mdf.to_csv(out_csv, index=False)
-        print(f"✔ Saved metrics → {out_csv}")
-    
-    # 5) Plot average metrics across emotions
-    for metric in ['readability', 'perplexity', 'lex_diversity']:
-        plt.figure(figsize=(6,4))
-        values = [metrics[emo][metric].mean() for emo in metrics]
-        plt.bar(metrics.keys(), values)
-        plt.xlabel("Emotion")
-        plt.ylabel(metric.replace('_',' ').title())
-        plt.title(f"Average {metric.replace('_',' ').title()} by Emotion")
-        plt.tight_layout()
-        filename = f"avg_{metric}.png"
-        plt.savefig(filename)
-        print(f"📊 Saved plot → {filename}")
-        plt.show()
+        df = pd.read_csv(filepath)
+        records = []
+
+        for _, row in df.iterrows():
+            resp = str(row["response"])
+            feats = {
+                "intensity":     row.get("intensity", None),
+                "readability":   textstat.flesch_reading_ease(resp),
+                "perplexity":    compute_perplexity(resp),
+                "lex_diversity": lexical_diversity(resp),
+                "word_count":    len(re.findall(r"\w+", resp)),
+            }
+
+            # Optional BLEU if a 'reference' column exists
+            if "reference" in df.columns:
+                ref = str(row["reference"])
+                feats["bleu"] = sentence_bleu(
+                    [ref.split()], resp.split(),
+                    smoothing_function=smooth_fn
+                )
+            else:
+                feats["bleu"] = None
+
+            records.append(feats)
+
+        # Derive base name and save metrics
+        base = os.path.basename(filepath).replace("_convos.csv", "")
+        out_path = os.path.join(output_dir, f"{base}_metrics.csv")
+        pd.DataFrame(records).to_csv(out_path, index=False)
+        print(f"✔ Saved metrics → {out_path}\n")
 
 if __name__ == "__main__":
     main()
