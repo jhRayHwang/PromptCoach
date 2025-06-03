@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "Prompt Saver",
+  "name": "Prompt Coach",
   "version": "1.0",
   "permissions": ["storage", "scripting"],
   "host_permissions": ["*://chatgpt.com/*"],
